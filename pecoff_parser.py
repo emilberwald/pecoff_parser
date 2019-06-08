@@ -1,4 +1,5 @@
 import subprocess
+import typing
 
 # create winnt.py from winnt.h
 args = [
@@ -51,10 +52,21 @@ def get_complex_type(symbol_table: IMAGE_SYMBOL):
     return IMAGE_SYM_DTYPE(complex_type)
 
 
+def get_sizeof(structure, attr):
+    KEY_INDEX = 0
+    VALUE_INDEX = 1
+    return next(
+        ctypes.sizeof(field[VALUE_INDEX])
+        for field in structure._fields_
+        if field[KEY_INDEX] == attr
+    )
+
+
 def get_bytes(structure, attr):
+    KEY_INDEX = 0
+    VALUE_INDEX = 1
     return getattr(structure, attr).to_bytes(
-        next(ctypes.sizeof(value) for key, value in structure._fields_ if key == attr),
-        byteorder=sys.byteorder,
+        get_sizeof(structure, attr), byteorder=sys.byteorder
     )
 
 
@@ -81,54 +93,88 @@ def pretty(val):
     return result
 
 
-def parse_buffer(input):
-    """
-    https://docs.microsoft.com/en-us/windows/desktop/Debug/pe-format
-    https://en.wikibooks.org/wiki/X86_Disassembly/Windows_Executable_Files    
-    http://www.pinvoke.net/default.aspx/Structures.IMAGE_DOS_HEADER
-    """
-    ms_dos_stub = IMAGE_DOS_HEADER()
-    input.readinto(ms_dos_stub)
-    if get_bytes(ms_dos_stub, "e_magic") == b"MZ":
-        pretty(ms_dos_stub)
-        input.seek(ms_dos_stub.e_lfanew)
-        image_nt_headers = IMAGE_NT_HEADERS()
-        input.readinto(image_nt_headers)
-        print(pretty(image_nt_headers))
-        assert (image_nt_headers.Signature).to_bytes(
-            4, byteorder=sys.byteorder
-        ) == b"PE\x00\x00"
-        image_file_header = image_nt_headers.FileHeader
-    else:
-        ms_dos_stub = None
-        input.seek(io.SEEK_SET)
-        image_file_header = IMAGE_FILE_HEADER()
-        input.readinto(image_file_header)
-
+def get_section_headers(
+    input, image_file_header: IMAGE_FILE_HEADER
+) -> List[IMAGE_SECTION_HEADER]:
     section_headers = list()
     for sectionHeaderNo in range(0, image_file_header.NumberOfSections):
         section_header = IMAGE_SECTION_HEADER()
         input.readinto(section_header)
-        section_headers.append(section_header)
-    section_headers_ending = input.tell()
 
+        print(pretty(section_header))
+
+        section_headers.append(section_header)
+    return section_headers
+
+
+def get_symbols(input, image_file_header: IMAGE_FILE_HEADER):
     input.seek(image_file_header.PointerToSymbolTable)
     symbols = list()
     for symbolNo in range(0, image_file_header.NumberOfSymbols):
         # TODO: if /bigobj, use _EX versions
         image_symbol = IMAGE_SYMBOL()
         input.readinto(image_symbol)
+
         print(pretty(image_symbol))
+
         # TODO: not everyone has aux symbol (@comp.id and @feat.00 seems to be special?)
         image_aux_symbol = IMAGE_AUX_SYMBOL()
         input.readinto(image_aux_symbol)
-        symbols.append((image_symbol, image_aux_symbol))
 
+        print(pretty(image_aux_symbol))
+
+        symbols.append((image_symbol, image_aux_symbol))
+    return symbols
+
+
+def get_section_content(input, section_header: IMAGE_SECTION_HEADER):
     # TODO: read and understand https://stackoverflow.com/questions/45212489/image-section-headers-virtualaddress-and-pointertorawdata-difference
-    section_buffers = list()
-    for section_header in section_headers:
-        input.seek(section_header.PointerToRawData)
-        section_buffers.append(io.BytesIO(input.read(section_header.SizeOfRawData)))
+    input.seek(section_header.PointerToRawData)
+    # TODO: find out what type it is
+    return io.BytesIO(input.read(section_header.SizeOfRawData))
+
+
+def parse_buffer(input):
+    """
+    https://docs.microsoft.com/en-us/windows/desktop/Debug/pe-format
+    https://en.wikibooks.org/wiki/X86_Disassembly/Windows_Executable_Files    
+    http://www.pinvoke.net/default.aspx/Structures.IMAGE_DOS_HEADER
+    """
+    input.seek(io.SEEK_SET)
+    if input.peek(getattr(IMAGE_DOS_HEADER, "e_magic")) == b"MZ":
+        # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+        # order of statements important
+        # vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
+        ms_dos_stub = IMAGE_DOS_HEADER()
+        input.readinto(ms_dos_stub)
+
+        print(pretty(ms_dos_stub))
+
+        input.seek(ms_dos_stub.e_lfanew)
+        image_nt_headers = IMAGE_NT_HEADERS()
+        input.readinto(image_nt_headers)
+        assert get_bytes(image_nt_headers, "Signature") == b"PE\x00\x00"
+
+        print(pretty(image_nt_headers))
+
+        section_headers = get_section_headers(input, image_nt_headers.FileHeader)
+
+        section_contents = list()
+        for section_header in section_headers:
+            section_contents.append(get_section_content(input, section_header))
+
+        symbols = get_symbols(input, image_nt_headers.FileHeader)
+    else:
+        image_file_header = IMAGE_FILE_HEADER()
+        input.readinto(image_file_header)
+
+        print(pretty(image_file_header))
+
+        section_headers = get_section_headers(input, image_file_header)
+        symbols = get_symbols(input, image_file_header)
+        section_contents = list()
+        for section_header in section_headers:
+            section_contents.append(get_section_content(input, section_headers))
 
     # TODO: rest of format
     pass
